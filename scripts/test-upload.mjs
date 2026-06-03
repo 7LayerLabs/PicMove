@@ -1,9 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
-
-const supabase = createClient(
-  "https://hnkjhhabebzmcwwhhfeu.supabase.co",
-  "sb_publishable_bSWy7hZPLEwilatHxnIzpw_re3uWe-V"
-);
+import { supabase } from "./_client.mjs";
 
 // 1x1 red PNG
 const png = Buffer.from(

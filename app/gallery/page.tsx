@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Image from "next/image";
 import { supabase, BUCKET } from "@/lib/supabase";
+import { SignOutButton } from "../AuthGate";
 
 type FileItem = { name: string; path: string; url: string; size: number; createdAt: string };
 type FolderCard = { key: string; label: string; count: number; coverUrl: string | null; isPrivate: boolean };
@@ -36,6 +37,26 @@ const EDIT_PRESETS = {
     "Turn this into a polished restaurant hero photo. Keep the same dish, improve composition, lighting, sharpness, and color, and place it on a clean food-safe surface. Make it look real, not overly glossy or artificial.",
 };
 
+// Photos live in a PRIVATE bucket, so we hand out short-lived signed URLs that
+// only work while signed in. One hour is plenty for a browsing session; the
+// 30s background refresh regenerates them well before they expire.
+const SIGNED_URL_TTL = 60 * 60;
+
+async function signedUrlMap(paths: string[]): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (paths.length === 0) return map;
+  const { data } = await supabase.storage.from(BUCKET).createSignedUrls(paths, SIGNED_URL_TTL);
+  for (const row of data || []) {
+    if (row.path && row.signedUrl) map.set(row.path, row.signedUrl);
+  }
+  return map;
+}
+
+async function signedUrl(path: string): Promise<string | null> {
+  const { data } = await supabase.storage.from(BUCKET).createSignedUrl(path, SIGNED_URL_TTL);
+  return data?.signedUrl ?? null;
+}
+
 export default function Gallery() {
   const [folderCards, setFolderCards] = useState<FolderCard[]>([]);
   const [currentFolder, setCurrentFolder] = useState<string | null>(null);
@@ -54,13 +75,24 @@ export default function Gallery() {
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
   const [unlockedFolders, setUnlockedFolders] = useState<Set<string>>(new Set());
 
+  // Refs let the background refresh read the latest values without re-creating
+  // the interval on every meta change, and let us pause it mid-save/drag.
+  const currentFolderRef = useRef(currentFolder);
+  const photoOrderRef = useRef(meta.photoOrder);
+  const savingRef = useRef(false);
+  useEffect(() => {
+    currentFolderRef.current = currentFolder;
+  }, [currentFolder]);
+  useEffect(() => {
+    photoOrderRef.current = meta.photoOrder;
+  }, [meta.photoOrder]);
+
   const loadMeta = useCallback(async (): Promise<Meta> => {
-    const { data } = supabase.storage.from(BUCKET).getPublicUrl(META_PATH);
     const empty: Meta = { folderOrder: [], photoOrder: {}, privateFolders: {} };
     try {
-      const r = await fetch(`${data.publicUrl}?t=${Date.now()}`, { cache: "no-store" });
-      if (!r.ok) return empty;
-      const j = await r.json();
+      const { data, error } = await supabase.storage.from(BUCKET).download(META_PATH);
+      if (error || !data) return empty;
+      const j = JSON.parse(await data.text());
       return {
         folderOrder: Array.isArray(j.folderOrder) ? j.folderOrder : [],
         photoOrder: j.photoOrder && typeof j.photoOrder === "object" ? j.photoOrder : {},
@@ -74,10 +106,16 @@ export default function Gallery() {
 
   const saveMeta = useCallback(async (next: Meta) => {
     setMeta(next);
-    const blob = new Blob([JSON.stringify(next)], { type: "application/json" });
-    await supabase.storage
-      .from(BUCKET)
-      .upload(META_PATH, blob, { upsert: true, contentType: "application/json" });
+    photoOrderRef.current = next.photoOrder;
+    savingRef.current = true;
+    try {
+      const blob = new Blob([JSON.stringify(next)], { type: "application/json" });
+      await supabase.storage
+        .from(BUCKET)
+        .upload(META_PATH, blob, { upsert: true, contentType: "application/json" });
+    } finally {
+      savingRef.current = false;
+    }
   }, []);
 
   const buildFolderCards = useCallback(
@@ -98,7 +136,7 @@ export default function Gallery() {
           const isPrivate = !!privateFolders[k];
           const { data } = await supabase.storage
             .from(BUCKET)
-            .list(prefix, { limit: 100, sortBy: { column: "created_at", order: "desc" } });
+            .list(prefix, { limit: 1000, sortBy: { column: "created_at", order: "desc" } });
           const files = (data || []).filter(
             (e) => e.id !== null && !e.name.startsWith(".") && !e.name.endsWith("/")
           );
@@ -106,9 +144,7 @@ export default function Gallery() {
           if (!isPrivate) {
             const cover = files[0];
             const coverPath = cover ? (prefix ? `${prefix}/${cover.name}` : cover.name) : null;
-            coverUrl = coverPath
-              ? supabase.storage.from(BUCKET).getPublicUrl(coverPath).data.publicUrl
-              : null;
+            coverUrl = coverPath ? await signedUrl(coverPath) : null;
           }
           const label = k === UNSORTED ? "Unsorted" : k;
           return { key: k, label, count: files.length, coverUrl, isPrivate };
@@ -148,13 +184,15 @@ export default function Gallery() {
       const files = (data || []).filter(
         (e) => e.id !== null && !e.name.startsWith(".") && !e.name.endsWith("/")
       );
+      const urls = await signedUrlMap(
+        files.map((f) => (prefix ? `${prefix}/${f.name}` : f.name))
+      );
       const mapped: FileItem[] = files.map((f) => {
         const path = prefix ? `${prefix}/${f.name}` : f.name;
-        const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(path);
         return {
           name: f.name,
           path,
-          url: pub.publicUrl,
+          url: urls.get(path) ?? "",
           size: (f.metadata as any)?.size ?? 0,
           createdAt: f.created_at ?? "",
         };
@@ -196,11 +234,15 @@ export default function Gallery() {
 
   useEffect(() => {
     const id = setInterval(() => {
+      // Skip while hidden (battery/data) or mid-save (avoid clobbering a drag).
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      if (savingRef.current) return;
       loadFolders();
-      if (currentFolder) loadItems(currentFolder, meta.photoOrder);
-    }, 8000);
+      const folder = currentFolderRef.current;
+      if (folder) loadItems(folder, photoOrderRef.current);
+    }, 30000);
     return () => clearInterval(id);
-  }, [currentFolder, meta.photoOrder, loadFolders, loadItems]);
+  }, [loadFolders, loadItems]);
 
   function toggleSelect(path: string) {
     setSelected((prev) => {
@@ -235,13 +277,15 @@ export default function Gallery() {
     const files = (data || []).filter(
       (e) => e.id !== null && !e.name.startsWith(".") && !e.name.endsWith("/")
     );
+    const urls = await signedUrlMap(
+      files.map((f) => (prefix ? `${prefix}/${f.name}` : f.name))
+    );
     const mapped: FileItem[] = files.map((f) => {
       const path = prefix ? `${prefix}/${f.name}` : f.name;
-      const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(path);
       return {
         name: f.name,
         path,
-        url: pub.publicUrl,
+        url: urls.get(path) ?? "",
         size: (f.metadata as any)?.size ?? 0,
         createdAt: f.created_at ?? "",
       };
@@ -291,6 +335,30 @@ export default function Gallery() {
       .join("");
   }
 
+  function randomSalt(): string {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  // Stored as "salt:hash". Salting stops trivial reuse of a precomputed hash
+  // if someone reads the (public) meta file. NOTE: this is cover-hiding, not
+  // real privacy — the bucket is public so files stay reachable by direct URL.
+  async function makeStoredPassword(pw: string): Promise<string> {
+    const salt = randomSalt();
+    return `${salt}:${await sha256(salt + pw)}`;
+  }
+
+  async function verifyPassword(pw: string, stored: string): Promise<boolean> {
+    if (stored.includes(":")) {
+      const [salt, hash] = stored.split(":");
+      return (await sha256(salt + pw)) === hash;
+    }
+    return (await sha256(pw)) === stored; // legacy unsalted entries
+  }
+
   async function newFolder() {
     const raw = prompt("New folder name (e.g. food, kids, restaurant):")?.trim();
     if (!raw) return;
@@ -307,11 +375,13 @@ export default function Gallery() {
       alert(error.message);
       return;
     }
-    const pw = prompt("Set a password to make this folder private? (leave blank to skip)")?.trim();
+    const pw = prompt(
+      "Password to hide this folder's cover preview? (Leave blank to skip. Note: photos stay reachable by direct link — this is not full privacy.)"
+    )?.trim();
     let nextMeta = meta;
     if (pw) {
-      const hash = await sha256(pw);
-      nextMeta = { ...meta, privateFolders: { ...meta.privateFolders, [slug]: hash } };
+      const stored = await makeStoredPassword(pw);
+      nextMeta = { ...meta, privateFolders: { ...meta.privateFolders, [slug]: stored } };
       await saveMeta(nextMeta);
       setUnlockedFolders((prev) => new Set([...prev, slug]));
     }
@@ -324,8 +394,7 @@ export default function Gallery() {
     if (isPrivate && !unlockedFolders.has(key)) {
       const pw = prompt(`Password for "${key}":`);
       if (!pw) return;
-      const hash = await sha256(pw);
-      if (hash !== meta.privateFolders[key]) {
+      if (!(await verifyPassword(pw, meta.privateFolders[key]))) {
         alert("Wrong password.");
         return;
       }
@@ -339,8 +408,7 @@ export default function Gallery() {
     if (isPrivate) {
       const current = prompt("Enter current password to remove the lock:");
       if (!current) return;
-      const got = await sha256(current);
-      if (got !== meta.privateFolders[folder]) {
+      if (!(await verifyPassword(current, meta.privateFolders[folder]))) {
         alert("Wrong password.");
         return;
       }
@@ -354,10 +422,12 @@ export default function Gallery() {
       });
       await loadFolders();
     } else {
-      const pw = prompt("Set a password to lock this folder:")?.trim();
+      const pw = prompt(
+        "Password to hide this folder's cover preview? (Note: photos stay reachable by direct link — this is not full privacy.)"
+      )?.trim();
       if (!pw) return;
-      const hash = await sha256(pw);
-      await saveMeta({ ...meta, privateFolders: { ...meta.privateFolders, [folder]: hash } });
+      const stored = await makeStoredPassword(pw);
+      await saveMeta({ ...meta, privateFolders: { ...meta.privateFolders, [folder]: stored } });
       setUnlockedFolders((prev) => new Set([...prev, folder]));
       await loadFolders();
     }
@@ -365,14 +435,44 @@ export default function Gallery() {
 
   async function deleteFolder(folder: string) {
     if (!confirm(`Delete folder "${folder}"? Files inside will move to Unsorted.`)) return;
-    const { data: contents } = await supabase.storage.from(BUCKET).list(folder, { limit: 1000 });
+    const { data: contents, error: listErr } = await supabase.storage
+      .from(BUCKET)
+      .list(folder, { limit: 1000 });
+    if (listErr) {
+      alert(listErr.message);
+      return;
+    }
+
+    const failures: string[] = [];
     for (const f of contents || []) {
       if (f.name.startsWith(".")) {
-        await supabase.storage.from(BUCKET).remove([`${folder}/${f.name}`]);
+        const { error } = await supabase.storage.from(BUCKET).remove([`${folder}/${f.name}`]);
+        if (error) failures.push(`${f.name}: ${error.message}`);
       } else {
-        await supabase.storage.from(BUCKET).move(`${folder}/${f.name}`, f.name);
+        // If a same-named file already sits in Unsorted, move() fails — keep a
+        // unique name so nothing is silently lost.
+        let dest = f.name;
+        let { error } = await supabase.storage.from(BUCKET).move(`${folder}/${f.name}`, dest);
+        if (error) {
+          dest = `${Date.now()}-${f.name}`;
+          ({ error } = await supabase.storage.from(BUCKET).move(`${folder}/${f.name}`, dest));
+        }
+        if (error) failures.push(`${f.name}: ${error.message}`);
       }
     }
+
+    if (failures.length) {
+      // Do NOT strip the folder's metadata (incl. its password) if files are
+      // still stranded — otherwise the folder reappears on next load, unlocked.
+      alert(
+        `Could not empty "${folder}" — ${failures.length} item(s) failed:\n\n${failures
+          .slice(0, 6)
+          .join("\n")}${failures.length > 6 ? `\n…and ${failures.length - 6} more` : ""}`
+      );
+      await loadFolders();
+      return;
+    }
+
     const nextOrder = meta.folderOrder.filter((k) => k !== folder);
     const nextPhotoOrder = { ...meta.photoOrder };
     delete nextPhotoOrder[folder];
@@ -508,42 +608,58 @@ export default function Gallery() {
       prev ? { ...prev, status: "editing", error: undefined, resultUrl: undefined } : prev
     );
 
-    const response = await fetch("/api/edit-photo", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sourcePath: editDraft.source.path,
-        referencePath: editDraft.referencePath || undefined,
-        prompt: editDraft.prompt,
-        size: editDraft.size,
-        quality: editDraft.quality,
-      }),
-    });
+    // AI edits are slow; abort after 90s so the modal can never get stuck.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90_000);
+    try {
+      const { data: sess } = await supabase.auth.getSession();
+      const token = sess.session?.access_token;
+      const response = await fetch("/api/edit-photo", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sourcePath: editDraft.source.path,
+          referencePath: editDraft.referencePath || undefined,
+          prompt: editDraft.prompt,
+          size: editDraft.size,
+          quality: editDraft.quality,
+        }),
+      });
 
-    const result = await response.json();
-    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setEditDraft((prev) =>
+          prev
+            ? { ...prev, status: "error", error: result?.error || "Could not edit this photo." }
+            : prev
+        );
+        return;
+      }
+
+      setEditDraft((prev) => (prev ? { ...prev, status: "done", resultUrl: result.url } : prev));
+      if (currentFolder) await loadItems(currentFolder, meta.photoOrder);
+    } catch (err) {
+      const aborted = err instanceof DOMException && err.name === "AbortError";
       setEditDraft((prev) =>
         prev
           ? {
               ...prev,
               status: "error",
-              error: result?.error || "Could not edit this photo.",
+              error: aborted
+                ? "The edit took too long and timed out. Try a smaller size or lower quality."
+                : err instanceof Error
+                ? err.message
+                : "Network error while editing.",
             }
           : prev
       );
-      return;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    setEditDraft((prev) =>
-      prev
-        ? {
-            ...prev,
-            status: "done",
-            resultUrl: result.url,
-          }
-        : prev
-    );
-    if (currentFolder) await loadItems(currentFolder, meta.photoOrder);
   }
 
   function reorder<T>(arr: T[], from: number, to: number): T[] {
@@ -604,9 +720,12 @@ export default function Gallery() {
             <h1 style={styles.title}>PicMove</h1>
             <p style={styles.subtitle}>Drag to reorder folders. Tap one to open.</p>
           </div>
-          <a href="/" style={styles.uploadBtn}>
-            <Icon.Plus /> Upload
-          </a>
+          <div style={styles.headerActions}>
+            <a href="/" style={styles.uploadBtn}>
+              <Icon.Plus /> Upload
+            </a>
+            <SignOutButton />
+          </div>
         </header>
 
         {error && <p style={styles.errorText}>{error}</p>}
@@ -726,9 +845,12 @@ export default function Gallery() {
           <h1 style={{ ...styles.title, marginTop: 4 }}>{activeLabel}</h1>
           <p style={styles.subtitle}>Drag photos to reorder.</p>
         </div>
-        <a href="/" style={styles.uploadBtn}>
-          <Icon.Plus /> Upload
-        </a>
+        <div style={styles.headerActions}>
+          <a href="/" style={styles.uploadBtn}>
+            <Icon.Plus /> Upload
+          </a>
+          <SignOutButton />
+        </div>
       </header>
 
       <div style={styles.actionsRow}>
@@ -1132,7 +1254,12 @@ export default function Gallery() {
             {editDraft.resultUrl && (
               <div style={styles.resultPanel}>
                 <span style={styles.fieldLabel}>Saved result</span>
-                <a href={editDraft.resultUrl} target="_blank" style={styles.resultLink}>
+                <a
+                  href={editDraft.resultUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={styles.resultLink}
+                >
                   Open generated image
                 </a>
               </div>
@@ -1223,6 +1350,7 @@ const Icon = {
 const styles: Record<string, React.CSSProperties> = {
   main: { maxWidth: 1280, margin: "0 auto", padding: "24px 16px 80px" },
   header: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 20 },
+  headerActions: { display: "flex", gap: 8, alignItems: "center", flexShrink: 0 },
   title: { fontSize: 32, fontWeight: 700, margin: 0, letterSpacing: -0.5 },
   subtitle: { margin: "6px 0 0", color: "#888", fontSize: 13 },
   uploadBtn: {
@@ -1245,7 +1373,9 @@ const styles: Record<string, React.CSSProperties> = {
   folderCard: {
     position: "relative",
     background: "#121212",
-    border: "2px solid transparent",
+    borderWidth: 2,
+    borderStyle: "solid",
+    borderColor: "transparent",
     borderRadius: 14,
     overflow: "hidden",
     cursor: "pointer",
@@ -1356,7 +1486,8 @@ const styles: Record<string, React.CSSProperties> = {
   grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 12 },
   card: {
     position: "relative", background: "#121212", borderRadius: 12, overflow: "hidden",
-    cursor: "pointer", border: "2px solid transparent", transition: "border-color 120ms, transform 80ms",
+    cursor: "pointer", borderWidth: 2, borderStyle: "solid", borderColor: "transparent",
+    transition: "border-color 120ms, transform 80ms",
   },
   cardSel: { borderColor: "var(--accent)" },
   imgWrap: { position: "relative", width: "100%", aspectRatio: "1", background: "#1a1a1a" },
@@ -1411,7 +1542,8 @@ const styles: Record<string, React.CSSProperties> = {
   referencePreview: { position: "relative", width: 120, aspectRatio: "1", borderRadius: 8, overflow: "hidden", background: "#1a1a1a" },
   presetRow: { display: "flex", gap: 8, flexWrap: "wrap" },
   smallBtn: {
-    background: "#171717", color: "#d8d8d8", border: "1px solid #303030",
+    background: "#171717", color: "#d8d8d8",
+    borderWidth: 1, borderStyle: "solid", borderColor: "#303030",
     borderRadius: 8, padding: "7px 10px", cursor: "pointer", fontSize: 13,
   },
   smallBtnActive: {
@@ -1438,7 +1570,9 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     overflow: "hidden",
     background: "#171717",
-    border: "2px solid #2a2a2a",
+    borderWidth: 2,
+    borderStyle: "solid",
+    borderColor: "#2a2a2a",
     cursor: "pointer",
   },
   plateOptionActive: { borderColor: "var(--accent)" },

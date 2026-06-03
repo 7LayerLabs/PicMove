@@ -3,47 +3,78 @@
 import { useState, useRef } from "react";
 import { supabase, BUCKET } from "@/lib/supabase";
 
-type UploadStatus = { name: string; state: "uploading" | "done" | "error"; url?: string; error?: string };
+type UploadState = "queued" | "uploading" | "done" | "error";
+type UploadStatus = { id: string; name: string; state: UploadState; error?: string };
+
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // matches the bucket's file_size_limit
+const UPLOAD_CONCURRENCY = 4; // how many upload at the same time; the rest wait in line
+
+function newId() {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
 export default function Home() {
   const [items, setItems] = useState<UploadStatus[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  function updateItem(id: string, patch: Partial<UploadStatus>) {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
+  }
+
+  async function uploadOne(file: File, id: string) {
+    try {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        updateItem(id, {
+          state: "error",
+          error: `Too large (${(file.size / 1048576).toFixed(1)} MB, max 25 MB)`,
+        });
+        return;
+      }
+      updateItem(id, { state: "uploading" });
+      const ext = (file.name.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const key = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext || "jpg"}`;
+      const { error } = await supabase.storage.from(BUCKET).upload(key, file, {
+        contentType: file.type || "image/jpeg",
+        upsert: false,
+      });
+      if (error) {
+        updateItem(id, { state: "error", error: error.message });
+        return;
+      }
+      updateItem(id, { state: "done" });
+    } catch (err) {
+      updateItem(id, {
+        state: "error",
+        error: err instanceof Error ? err.message : "Upload failed",
+      });
+    }
+  }
+
   async function uploadFiles(files: FileList | File[]) {
     const arr = Array.from(files);
-    const startIndex = items.length;
-    setItems((prev) => [
-      ...prev,
-      ...arr.map<UploadStatus>((f) => ({ name: f.name, state: "uploading" })),
-    ]);
+    const queued = arr.map<UploadStatus>((f) => ({ id: newId(), name: f.name, state: "queued" }));
+    setItems((prev) => [...prev, ...queued]);
 
-    await Promise.all(
-      arr.map(async (file, i) => {
-        const ext = file.name.split(".").pop() || "jpg";
-        const key = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
-        const { error } = await supabase.storage.from(BUCKET).upload(key, file, {
-          contentType: file.type || "image/jpeg",
-          upsert: false,
-        });
-        const idx = startIndex + i;
-        if (error) {
-          setItems((prev) => {
-            const copy = [...prev];
-            copy[idx] = { ...copy[idx], state: "error", error: error.message };
-            return copy;
-          });
-          return;
-        }
-        const { data } = supabase.storage.from(BUCKET).getPublicUrl(key);
-        setItems((prev) => {
-          const copy = [...prev];
-          copy[idx] = { ...copy[idx], state: "done", url: data.publicUrl };
-          return copy;
-        });
-      })
-    );
+    // Worker pool: only UPLOAD_CONCURRENCY run at once; each worker pulls the
+    // next file off the line until everything is done. No choking on big batches.
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < arr.length) {
+        const i = cursor++;
+        await uploadOne(arr[i], queued[i].id);
+      }
+    };
+    const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, arr.length) }, worker);
+    await Promise.all(workers);
   }
+
+  const total = items.length;
+  const done = items.filter((i) => i.state === "done").length;
+  const failed = items.filter((i) => i.state === "error").length;
+  const remaining = total - done - failed;
 
   return (
     <main style={styles.main}>
@@ -76,34 +107,45 @@ export default function Home() {
         <input
           ref={inputRef}
           type="file"
-          accept="image/*,video/*"
+          accept="image/*"
           multiple
           style={{ display: "none" }}
           onChange={(e) => { if (e.target.files?.length) uploadFiles(e.target.files); e.target.value = ""; }}
         />
       </div>
 
-      {items.length > 0 && (
-        <ul style={styles.list}>
-          {items.map((it, i) => (
-            <li key={i} style={styles.row}>
-              <span style={styles.rowName}>{it.name}</span>
-              <span style={{ ...styles.badge, ...badgeStyle(it.state) }}>
-                {it.state === "uploading" && "uploading…"}
-                {it.state === "done" && "✓ done"}
-                {it.state === "error" && `✕ ${it.error}`}
-              </span>
-            </li>
-          ))}
-        </ul>
+      {total > 0 && (
+        <>
+          <div style={styles.progress}>
+            <span style={styles.progressText}>
+              {done + failed} of {total} done
+            </span>
+            {remaining > 0 && <span style={styles.muted}>· {remaining} to go</span>}
+            {failed > 0 && <span style={styles.progressFail}>· {failed} failed</span>}
+          </div>
+          <ul style={styles.list}>
+            {items.map((it) => (
+              <li key={it.id} style={styles.row}>
+                <span style={styles.rowName}>{it.name}</span>
+                <span style={{ ...styles.badge, ...badgeStyle(it.state) }}>
+                  {it.state === "queued" && "waiting…"}
+                  {it.state === "uploading" && "uploading…"}
+                  {it.state === "done" && "✓ done"}
+                  {it.state === "error" && `✕ ${it.error}`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
     </main>
   );
 }
 
-function badgeStyle(state: UploadStatus["state"]): React.CSSProperties {
+function badgeStyle(state: UploadState): React.CSSProperties {
   if (state === "done") return { background: "#10331c", color: "#7be29c" };
   if (state === "error") return { background: "#3a1414", color: "#ff8b8b" };
+  if (state === "queued") return { background: "#1f1f1f", color: "#999" };
   return { background: "#1a2740", color: "#7eb0ff" };
 }
 
@@ -113,7 +155,9 @@ const styles: Record<string, React.CSSProperties> = {
   title: { fontSize: 28, fontWeight: 700, margin: 0, letterSpacing: -0.5 },
   link: { color: "var(--accent)", textDecoration: "none", fontSize: 16 },
   drop: {
-    border: "2px dashed #333",
+    borderWidth: 2,
+    borderStyle: "dashed",
+    borderColor: "#333",
     borderRadius: 16,
     padding: "48px 16px",
     textAlign: "center",
@@ -125,7 +169,11 @@ const styles: Record<string, React.CSSProperties> = {
   icon: { color: "#888", display: "flex", alignItems: "center", justifyContent: "center" },
   dropText: { fontSize: 17, fontWeight: 600 },
   dropHint: { fontSize: 13, color: "#888" },
-  list: { listStyle: "none", padding: 0, marginTop: 24, display: "flex", flexDirection: "column", gap: 8 },
+  progress: { display: "flex", gap: 6, alignItems: "center", marginTop: 24, fontSize: 14, flexWrap: "wrap" },
+  progressText: { fontWeight: 700 },
+  progressFail: { color: "#ff8b8b", fontWeight: 600 },
+  muted: { color: "#888" },
+  list: { listStyle: "none", padding: 0, marginTop: 12, display: "flex", flexDirection: "column", gap: 8 },
   row: {
     display: "flex", justifyContent: "space-between", alignItems: "center",
     padding: "10px 14px", background: "#121212", borderRadius: 10, fontSize: 14,

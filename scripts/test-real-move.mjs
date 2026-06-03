@@ -1,8 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
-const s = createClient(
-  "https://hnkjhhabebzmcwwhhfeu.supabase.co",
-  "sb_publishable_bSWy7hZPLEwilatHxnIzpw_re3uWe-V"
-);
+import { supabase as s } from "./_client.mjs";
 
 const { data: rootList } = await s.storage.from("pics").list("");
 const realFile = rootList.find((e) => e.id !== null && !e.name.startsWith("."));
