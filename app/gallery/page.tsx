@@ -344,8 +344,8 @@ export default function Gallery() {
   }
 
   // Stored as "salt:hash". Salting stops trivial reuse of a precomputed hash
-  // if someone reads the (public) meta file. NOTE: this is cover-hiding, not
-  // real privacy — the bucket is public so files stay reachable by direct URL.
+  // if someone reads the meta file. NOTE: this is cover-hiding, not real
+  // privacy — any signed-in user can still list the folder and fetch its files.
   async function makeStoredPassword(pw: string): Promise<string> {
     const salt = randomSalt();
     return `${salt}:${await sha256(salt + pw)}`;
